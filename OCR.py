@@ -5,6 +5,8 @@ import threading
 import queue
 import os
 import sys
+import re
+import textwrap
 
 import numpy as np
 import cv2
@@ -16,7 +18,7 @@ from PIL import Image
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-# =========== OCR core ===========
+# ===================== OCR core =====================
 
 # --- Robust deskew (OSD + Hough + clamp) ---
 def _coarse_rotate_osd(gray: np.ndarray) -> np.ndarray:
@@ -111,20 +113,110 @@ def ocr_image(img_for_ocr: np.ndarray, lang="ron+eng", psm=4) -> tuple[str, floa
     mean_conf = float(np.mean(confs)) if confs else 0.0
     return text, mean_conf
 
+# ---------- Paragraf filtering (min words + mean conf) ----------
+def _format_paragraph(text: str, width: int = 100) -> str:
+    t = text.strip()
+    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"\s+([,.;:!?])", r"\1", t)
+    t = re.sub(r"([(\[{])\s+", r"\1", t)
+    t = re.sub(r"\s+([)\]}])", r"\1", t)
+    return textwrap.fill(t, width=width)
+
+def _group_paragraphs_min_words_and_conf(data, min_words_per_par=8, min_par_mean_conf=65):
+    """
+    Grupează cuvintele după (block_num, par_num), calculează mean_conf pe paragraf
+    și păstrează doar paragrafele cu >= min_words_per_par și mean_conf >= min_par_mean_conf.
+    Returnează listă de (text_paragraf, mean_conf_paragraf) în ordinea de citire.
+    """
+    n = len(data["text"])
+    def to_int_list(lst):
+        out = []
+        for v in lst:
+            try: out.append(int(v))
+            except: out.append(-1)
+        return out
+
+    level  = to_int_list(data.get("level", [""]*n))
+    block  = to_int_list(data.get("block_num", [""]*n))
+    parnum = to_int_list(data.get("par_num", [""]*n))
+    left   = to_int_list(data.get("left", [""]*n))
+    top    = to_int_list(data.get("top", [""]*n))
+    words  = data.get("text", [""]*n)
+
+    confs = []
+    for v in data.get("conf", [""]*n):
+        try: confs.append(int(v))
+        except: confs.append(-1)
+
+    buckets = {}
+    for i in range(n):
+        if level[i] != 5:  # word level
+            continue
+        if confs[i] < 0:
+            continue
+        tok = (words[i] or "").strip()
+        if not tok:
+            continue
+        key = (block[i], parnum[i])
+        if key not in buckets:
+            buckets[key] = {"tokens": [], "confs": [], "tops": [], "lefts": []}
+        buckets[key]["tokens"].append(tok)
+        buckets[key]["confs"].append(confs[i])
+        buckets[key]["tops"].append(top[i])
+        buckets[key]["lefts"].append(left[i])
+
+    paras = []
+    for key, B in buckets.items():
+        if len(B["tokens"]) < min_words_per_par:
+            continue
+        mc = float(np.mean(B["confs"])) if B["confs"] else 0.0
+        if mc < min_par_mean_conf:
+            continue
+        txt = " ".join(B["tokens"])
+        t_med = int(np.median(B["tops"])) if B["tops"] else 0
+        l_med = int(np.median(B["lefts"])) if B["lefts"] else 0
+        paras.append((t_med, l_med, txt, mc))
+
+    paras.sort(key=lambda x: (x[0], x[1]))
+    return [(p[2], p[3]) for p in paras]
+
+def ocr_paragraphs_filtered(img_for_ocr: np.ndarray, lang="ron+eng", psm=4,
+                            min_words_per_par=8, min_par_mean_conf=65, wrap_width=100):
+    """
+    OCR -> paragrafe filtrate după #cuvinte și mean_conf pe paragraf -> formatare frumoasă.
+    Întoarce (text_concat_curat, mean_conf_global, lista_paragrafe_curate).
+    """
+    cfg = f"--oem 1 --psm {psm} -l {lang} -c user_defined_dpi=300 -c preserve_interword_spaces=1"
+    data = pytesseract.image_to_data(img_for_ocr, config=cfg, output_type=Output.DICT)
+
+    confs_all = [int(c) for c in data.get("conf", []) if str(c).isdigit() and int(c) >= 0]
+    mean_conf_global = float(np.mean(confs_all)) if confs_all else 0.0
+
+    raw_paras = _group_paragraphs_min_words_and_conf(
+        data,
+        min_words_per_par=min_words_per_par,
+        min_par_mean_conf=min_par_mean_conf
+    )
+
+    formatted = [_format_paragraph(txt, width=wrap_width) for (txt, _mc) in raw_paras]
+    text_concat = "\n\n".join(formatted)
+    return text_concat, mean_conf_global, raw_paras
+
 def pil_to_bgr(im: Image.Image) -> np.ndarray:
     return cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR)
 
 def process_pdf(pdf_path: Path, outdir: Path, dpi=300, lang="ron+eng", psm=4,
-                save_debug=False, start=None, end=None, log=lambda *_: None):
+                save_debug=False, start=None, end=None, log=lambda *_: None,
+                use_paragraph_filter=True, min_words_per_par=8, min_par_mean_conf=65, wrap_width=100):
     outdir.mkdir(parents=True, exist_ok=True)
     dbgdir = outdir / "debug"
     if save_debug:
         dbgdir.mkdir(exist_ok=True)
 
-    # Convertim paginile PDF la imagini (ne bazăm pe Poppler din PATH)
     pages = convert_from_path(str(pdf_path), dpi=dpi, first_page=start, last_page=end)
 
-    combined_text = []
+    combined_text_raw = []
+    combined_text_clean = []
     page_stats = []
 
     for idx, page in enumerate(pages, 1 if start is None else start):
@@ -137,38 +229,65 @@ def process_pdf(pdf_path: Path, outdir: Path, dpi=300, lang="ron+eng", psm=4,
         if save_debug:
             cv2.imwrite(str(dbgdir / f"{idx:03d}_prep.png"), prep)
 
-        text, mean_conf = ocr_image(prep, lang=lang, psm=psm)
+        # RAW (brut)
+        raw_text, raw_mean_conf = ocr_image(prep, lang=lang, psm=psm)
         (outdir / "pages").mkdir(exist_ok=True)
-        page_txt = outdir / "pages" / f"page_{idx:03d}.txt"
-        page_txt.write_text(text, encoding="utf-8")
+        (outdir / "pages_clean").mkdir(exist_ok=True)
 
-        combined_text.append(text)
-        page_stats.append((idx, mean_conf))
-        log(f"[pagina {idx}] mean_conf={mean_conf:.2f}")
+        page_txt_raw = outdir / "pages" / f"page_{idx:03d}.txt"
+        page_txt_raw.write_text(raw_text, encoding="utf-8")
+        combined_text_raw.append(raw_text)
 
-    # Scriem textul combinat & statistici
+        # CLEAN (paragrafe filtrate + formatate)
+        if use_paragraph_filter:
+            clean_text, mean_conf_global, _raw_paras = ocr_paragraphs_filtered(
+                prep, lang=lang, psm=psm,
+                min_words_per_par=min_words_per_par,
+                min_par_mean_conf=min_par_mean_conf,
+                wrap_width=wrap_width
+            )
+            page_txt_clean = outdir / "pages_clean" / f"page_{idx:03d}_clean.txt"
+            page_txt_clean.write_text(clean_text, encoding="utf-8")
+            combined_text_clean.append(clean_text)
+            # folosim pentru log mean_conf_global (informativ)
+            page_stats.append((idx, mean_conf_global))
+            log(f"[pagina {idx}] conf_global={mean_conf_global:.2f} (raw_mean={raw_mean_conf:.2f})")
+        else:
+            page_stats.append((idx, raw_mean_conf))
+            log(f"[pagina {idx}] mean_conf={raw_mean_conf:.2f}")
+
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    combined_path = outdir / f"pdf_ocr_{ts}.txt"
-    combined_path.write_text("\n\n".join(combined_text), encoding="utf-8")
 
+    # Scriem combinatul brut
+    combined_path_raw = outdir / f"pdf_ocr_{ts}.txt"
+    combined_path_raw.write_text("\n\n".join(combined_text_raw), encoding="utf-8")
+    log(f"📝 Text combinat (raw):   {combined_path_raw}")
+
+    # Scriem combinatul curat (dacă s-a folosit filtrarea)
+    if use_paragraph_filter:
+        combined_path_clean = outdir / f"pdf_ocr_clean_{ts}.txt"
+        combined_path_clean.write_text("\n\n".join(combined_text_clean), encoding="utf-8")
+        log(f"🧹 Text combinat (clean): {combined_path_clean}")
+
+    # Statistici (pe pagina, din global/ raw)
     stats_path = outdir / f"stats_{ts}.txt"
     with open(stats_path, "w", encoding="utf-8") as f:
         for i, c in page_stats:
             f.write(f"page {i:03d}: mean_conf={c:.2f}\n")
+    log(f"📈 Statistici: {stats_path}")
+
+    if save_debug:
+        log(f"🔍 Debug images: {dbgdir}")
 
     log("✅ Gata.")
-    log(f"📝 Text combinat: {combined_path}")
-    log(f"📈 Statistici:    {stats_path}")
-    if save_debug:
-        log(f"🔍 Debug images:  {dbgdir}")
 
-# =========== GUI (Tkinter) ===========
+# ===================== GUI (Tkinter) =====================
 
 class OCRGui(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("PDF Scan OCR (Tesseract)")
-        self.geometry("820x520")
+        self.geometry("880x640")
         self.resizable(True, True)
 
         # Vars
@@ -181,13 +300,16 @@ class OCRGui(tk.Tk):
         self.start_page = tk.StringVar()
         self.end_page   = tk.StringVar()
 
+        # Paragraph filtering (debuggable)
+        self.use_par_filter     = tk.BooleanVar(value=True)
+        self.min_words_per_par  = tk.IntVar(value=8)
+        self.min_par_mean_conf  = tk.IntVar(value=65)
+        self.wrap_width         = tk.IntVar(value=100)
+
         self._build_ui()
 
-        # logger queue pentru thread
         self.log_q = queue.Queue()
         self.after(100, self._poll_log)
-
-        # worker thread handle
         self.worker = None
 
     def _build_ui(self):
@@ -226,16 +348,33 @@ class OCRGui(tk.Tk):
         ttk.Label(frm4, text="End page:").pack(side='left')
         ttk.Entry(frm4, textvariable=self.end_page, width=8).pack(side='left', padx=6)
 
-        # Row 5: Buttons + progress
+        # Row 5: Paragraph filtering (debug)
+        frm5 = ttk.Labelframe(self, text="Paragraph filtering (debug)")
+        frm5.pack(fill='x', **pad)
+        ttk.Checkbutton(frm5, text="Use paragraph filtering", variable=self.use_par_filter).grid(row=0, column=0, sticky='w', padx=6, pady=4, columnspan=2)
+
+        ttk.Label(frm5, text="Min words / paragraph:").grid(row=1, column=0, sticky='w', padx=6, pady=4)
+        ttk.Spinbox(frm5, from_=1, to=50, textvariable=self.min_words_per_par, width=6).grid(row=1, column=1, sticky='w', padx=6, pady=4)
+
+        ttk.Label(frm5, text="Min mean conf (paragraph):").grid(row=1, column=2, sticky='w', padx=6, pady=4)
+        ttk.Spinbox(frm5, from_=0, to=100, textvariable=self.min_par_mean_conf, width=6).grid(row=1, column=3, sticky='w', padx=6, pady=4)
+
+        ttk.Label(frm5, text="Wrap width (chars):").grid(row=1, column=4, sticky='w', padx=6, pady=4)
+        ttk.Spinbox(frm5, from_=40, to=160, textvariable=self.wrap_width, width=6).grid(row=1, column=5, sticky='w', padx=6, pady=4)
+
+        for c in range(6):
+            frm5.columnconfigure(c, weight=1)
+
+        # Row 6: Buttons + progress
         frm6 = ttk.Frame(self); frm6.pack(fill='x', **pad)
         self.run_btn = ttk.Button(frm6, text="Rulează OCR", command=self._run_clicked)
         self.run_btn.pack(side='left')
         ttk.Button(frm6, text="Deschide output", command=self._open_outdir).pack(side='left', padx=8)
 
-        self.pb = ttk.Progressbar(frm6, mode='indeterminate', length=200)
+        self.pb = ttk.Progressbar(frm6, mode='indeterminate', length=220)
         self.pb.pack(side='right')
 
-        # Row 6: Log
+        # Row 7: Log
         frm7 = ttk.Frame(self); frm7.pack(fill='both', expand=True, **pad)
         ttk.Label(frm7, text="Log:").pack(anchor='w')
         self.log_txt = tk.Text(frm7, height=12, wrap='word')
@@ -301,6 +440,11 @@ class OCRGui(tk.Tk):
         start = self._parse_int(self.start_page.get())
         end   = self._parse_int(self.end_page.get())
 
+        use_par_filter = bool(self.use_par_filter.get())
+        min_words = int(self.min_words_per_par.get())
+        min_conf  = int(self.min_par_mean_conf.get())
+        wrap_w    = int(self.wrap_width.get())
+
         # pornește thread-ul de lucru
         self.run_btn.configure(state='disabled')
         self.pb.start(10)
@@ -308,6 +452,7 @@ class OCRGui(tk.Tk):
         self._log(f"→ PDF: {pdf}")
         self._log(f"→ Output: {outdir}")
         self._log(f"→ DPI={dpi}, PSM={psm}, Lang={lang}, Debug={debug}, Start={start}, End={end}")
+        self._log(f"→ Paragraph filter: use={use_par_filter}, min_words={min_words}, min_conf={min_conf}, wrap={wrap_w}")
 
         def work():
             try:
@@ -320,7 +465,11 @@ class OCRGui(tk.Tk):
                     save_debug=debug,
                     start=start,
                     end=end,
-                    log=self._log
+                    log=self._log,
+                    use_paragraph_filter=use_par_filter,
+                    min_words_per_par=min_words,
+                    min_par_mean_conf=min_conf,
+                    wrap_width=wrap_w
                 )
             except Exception as e:
                 self._log(f"❌ Eroare: {e}")
@@ -341,11 +490,11 @@ class OCRGui(tk.Tk):
         except:
             return None
 
-# =========== Entry-point (opțional: permite și CLI clasic) ===========
+# ===================== Entry-point =====================
 
 def main_cli():
     ap = argparse.ArgumentParser(description="Pornește GUI-ul OCR pentru PDF-uri scanate.")
-    ap.add_argument("--cli", action="store_true", help="Rulează în modul CLI (fără GUI) – compatibil cu scriptul anterior.")
+    ap.add_argument("--cli", action="store_true", help="Rulează în modul CLI (fără GUI).")
     ap.add_argument("--pdf")
     ap.add_argument("--outdir", default="pdf_ocr_output")
     ap.add_argument("--dpi", type=int, default=300)
@@ -354,6 +503,10 @@ def main_cli():
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--start", type=int)
     ap.add_argument("--end", type=int)
+    ap.add_argument("--use_par_filter", action="store_true")
+    ap.add_argument("--min_words_per_par", type=int, default=8)
+    ap.add_argument("--min_par_mean_conf", type=int, default=65)
+    ap.add_argument("--wrap_width", type=int, default=100)
     args = ap.parse_args()
 
     if args.cli:
@@ -366,7 +519,11 @@ def main_cli():
             save_debug=args.debug,
             start=args.start,
             end=args.end,
-            log=print
+            log=print,
+            use_paragraph_filter=args.use_par_filter,
+            min_words_per_par=args.min_words_per_par,
+            min_par_mean_conf=args.min_par_mean_conf,
+            wrap_width=args.wrap_width
         )
     else:
         app = OCRGui()
