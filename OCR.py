@@ -16,9 +16,9 @@ from PIL import Image
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-# =========== OCR core (din scriptul tău, cu mici corecții) ===========
+# =========== OCR core ===========
 
-# === Robust deskew (OSD + Hough + clamp) ===
+# --- Robust deskew (OSD + Hough + clamp) ---
 def _coarse_rotate_osd(gray: np.ndarray) -> np.ndarray:
     """Corecție grosieră 0/90/180/270 folosind OSD din Tesseract."""
     try:
@@ -103,7 +103,6 @@ def preprocess_for_ocr(
     sc = cv2.resize(m, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_CUBIC)
     return sc
 
-
 def ocr_image(img_for_ocr: np.ndarray, lang="ron+eng", psm=4) -> tuple[str, float]:
     cfg = f"--oem 1 --psm {psm} -l {lang} -c user_defined_dpi=300 -c preserve_interword_spaces=1"
     text = pytesseract.image_to_string(img_for_ocr, config=cfg)
@@ -116,15 +115,14 @@ def pil_to_bgr(im: Image.Image) -> np.ndarray:
     return cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR)
 
 def process_pdf(pdf_path: Path, outdir: Path, dpi=300, lang="ron+eng", psm=4,
-                save_debug=False, start=None, end=None, poppler_path=None, log=lambda *_: None):
+                save_debug=False, start=None, end=None, log=lambda *_: None):
     outdir.mkdir(parents=True, exist_ok=True)
     dbgdir = outdir / "debug"
     if save_debug:
         dbgdir.mkdir(exist_ok=True)
 
-    # Convertim paginile PDF la imagini (ai nevoie de Poppler; dacă e pe Windows, poți pasa poppler_path)
-    pages = convert_from_path(str(pdf_path), dpi=dpi, first_page=start, last_page=end,
-                              poppler_path=poppler_path)
+    # Convertim paginile PDF la imagini (ne bazăm pe Poppler din PATH)
+    pages = convert_from_path(str(pdf_path), dpi=dpi, first_page=start, last_page=end)
 
     combined_text = []
     page_stats = []
@@ -170,7 +168,7 @@ class OCRGui(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("PDF Scan OCR (Tesseract)")
-        self.geometry("820x560")
+        self.geometry("820x520")
         self.resizable(True, True)
 
         # Vars
@@ -182,8 +180,6 @@ class OCRGui(tk.Tk):
         self.debug      = tk.BooleanVar(value=False)
         self.start_page = tk.StringVar()
         self.end_page   = tk.StringVar()
-        self.poppler    = tk.StringVar()  # folderul bin poppler (opțional, Windows)
-        self.tesseract  = tk.StringVar()  # calea către tesseract.exe (opțional)
 
         self._build_ui()
 
@@ -230,19 +226,7 @@ class OCRGui(tk.Tk):
         ttk.Label(frm4, text="End page:").pack(side='left')
         ttk.Entry(frm4, textvariable=self.end_page, width=8).pack(side='left', padx=6)
 
-        # Row 5: Optional paths (Poppler, Tesseract)
-        frm5 = ttk.Labelframe(self, text="Căi opționale (Windows)")
-        frm5.pack(fill='x', **pad)
-        ttk.Label(frm5, text="Poppler bin:").grid(row=0, column=0, sticky='w', padx=6, pady=4)
-        ttk.Entry(frm5, textvariable=self.poppler, width=64).grid(row=0, column=1, sticky='we', padx=6, pady=4)
-        ttk.Button(frm5, text="Browse…", command=self._choose_poppler).grid(row=0, column=2, padx=6, pady=4)
-
-        ttk.Label(frm5, text="tesseract.exe:").grid(row=1, column=0, sticky='w', padx=6, pady=4)
-        ttk.Entry(frm5, textvariable=self.tesseract, width=64).grid(row=1, column=1, sticky='we', padx=6, pady=4)
-        ttk.Button(frm5, text="Browse…", command=self._choose_tesseract).grid(row=1, column=2, padx=6, pady=4)
-        frm5.columnconfigure(1, weight=1)
-
-        # Row 6: Buttons + progress
+        # Row 5: Buttons + progress
         frm6 = ttk.Frame(self); frm6.pack(fill='x', **pad)
         self.run_btn = ttk.Button(frm6, text="Rulează OCR", command=self._run_clicked)
         self.run_btn.pack(side='left')
@@ -251,7 +235,7 @@ class OCRGui(tk.Tk):
         self.pb = ttk.Progressbar(frm6, mode='indeterminate', length=200)
         self.pb.pack(side='right')
 
-        # Row 7: Log
+        # Row 6: Log
         frm7 = ttk.Frame(self); frm7.pack(fill='both', expand=True, **pad)
         ttk.Label(frm7, text="Log:").pack(anchor='w')
         self.log_txt = tk.Text(frm7, height=12, wrap='word')
@@ -259,7 +243,7 @@ class OCRGui(tk.Tk):
         self.log_txt.configure(state='disabled')
 
         # Footer
-        ttk.Label(self, text="Sfaturi: PSM 4 pentru pagini 1 coloană, 6 pentru bloc text; limbi: ron+eng; DPI 300.").pack(anchor='w', padx=10, pady=4)
+        ttk.Label(self, text="PSM 4 = 1 coloană; PSM 6 = bloc text; limbi ex. ron+eng; DPI 300.").pack(anchor='w', padx=10, pady=4)
 
     def _choose_pdf(self):
         f = filedialog.askopenfilename(filetypes=[("PDF files","*.pdf")])
@@ -270,16 +254,6 @@ class OCRGui(tk.Tk):
         d = filedialog.askdirectory()
         if d:
             self.out_dir.set(d)
-
-    def _choose_poppler(self):
-        d = filedialog.askdirectory(title="Alege folderul bin Poppler (conține pdftoppm.exe)")
-        if d:
-            self.poppler.set(d)
-
-    def _choose_tesseract(self):
-        f = filedialog.askopenfilename(title="Alege tesseract.exe", filetypes=[("Executable","*.exe"),("All","*.*")])
-        if f:
-            self.tesseract.set(f)
 
     def _open_outdir(self):
         p = self.out_dir.get().strip()
@@ -326,12 +300,6 @@ class OCRGui(tk.Tk):
         debug = bool(self.debug.get())
         start = self._parse_int(self.start_page.get())
         end   = self._parse_int(self.end_page.get())
-        poppler_path = self.poppler.get().strip() or None
-        tesseract_exe = self.tesseract.get().strip() or None
-
-        # setăm tesseract dacă e specificat
-        if tesseract_exe:
-            pytesseract.pytesseract.tesseract_cmd = tesseract_exe
 
         # pornește thread-ul de lucru
         self.run_btn.configure(state='disabled')
@@ -340,8 +308,6 @@ class OCRGui(tk.Tk):
         self._log(f"→ PDF: {pdf}")
         self._log(f"→ Output: {outdir}")
         self._log(f"→ DPI={dpi}, PSM={psm}, Lang={lang}, Debug={debug}, Start={start}, End={end}")
-        if poppler_path: self._log(f"→ Poppler bin: {poppler_path}")
-        if tesseract_exe: self._log(f"→ tesseract.exe: {tesseract_exe}")
 
         def work():
             try:
@@ -354,7 +320,6 @@ class OCRGui(tk.Tk):
                     save_debug=debug,
                     start=start,
                     end=end,
-                    poppler_path=poppler_path,
                     log=self._log
                 )
             except Exception as e:
@@ -389,13 +354,9 @@ def main_cli():
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--start", type=int)
     ap.add_argument("--end", type=int)
-    ap.add_argument("--poppler_path")
-    ap.add_argument("--tesseract_exe")
     args = ap.parse_args()
 
     if args.cli:
-        if args.tesseract_exe:
-            pytesseract.pytesseract.tesseract_cmd = args.tesseract_exe
         process_pdf(
             pdf_path=Path(args.pdf),
             outdir=Path(args.outdir),
@@ -405,7 +366,6 @@ def main_cli():
             save_debug=args.debug,
             start=args.start,
             end=args.end,
-            poppler_path=args.poppler_path,
             log=print
         )
     else:
