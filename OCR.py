@@ -18,6 +18,76 @@ from PIL import Image
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+# ===================== Helpers: base/bin detection & health check =====================
+
+def _frozen_base_dir(log_fn=None) -> Path:
+    """Returnează folderul de bază al aplicației:
+       - în one-folder/one-file: folderul exe-ului
+       - în dev: folderul scriptului .py
+    """
+    if getattr(sys, "frozen", False):
+        base = Path(sys.executable).parent
+        if log_fn:
+            log_fn(f"[i] frozen=True  exe={sys.executable}")
+            log_fn(f"[i] base_dir={base}")
+        return base
+    base = Path(__file__).parent
+    if log_fn:
+        log_fn(f"[i] frozen=False script_dir={base}")
+    return base
+
+def _bin_dir(log_fn=None) -> Path:
+    """În build: <exe>/bin; în dev: thirdparty/poppler/bin (fallback)."""
+    base = _frozen_base_dir(log_fn)
+    candidate = base / "bin"
+    if candidate.exists():
+        if log_fn: log_fn(f"✅ BIN folder: {candidate}")
+        return candidate
+    dev_poppler_bin = Path(__file__).parent / "bin"
+    if log_fn: log_fn(f"⚠️ Fallback DEV poppler bin: {dev_poppler_bin}")
+    return dev_poppler_bin
+
+def _health_check(bin_path: Path, log_fn=None) -> dict:
+    """Verifică rapid prezența binarelor & datelor necesare și setează tesseract_cmd."""
+    def _log(msg): (log_fn or print)(msg)
+
+    tesseract_exe = bin_path / "tesseract.exe"
+    tessdata_dir  = bin_path / "tessdata"
+    osd_file      = tessdata_dir / "osd.traineddata"
+    eng_file      = tessdata_dir / "eng.traineddata"
+    ron_file      = tessdata_dir / "ron.traineddata"
+    pdftoppm_exe  = bin_path / "pdftoppm.exe"
+    pdftocairo_exe= bin_path / "pdftocairo.exe"
+
+    checks = {
+        "tesseract_exe": tesseract_exe.exists(),
+        "tessdata_dir":  tessdata_dir.exists(),
+        "osd_trained":   osd_file.exists(),
+        "eng_trained":   eng_file.exists(),
+        "ron_trained":   ron_file.exists(),
+        "pdftoppm":      pdftoppm_exe.exists(),
+        "pdftocairo":    pdftocairo_exe.exists(),
+    }
+
+    _log(f"[check] tesseract.exe: {checks['tesseract_exe']}  -> {tesseract_exe}")
+    _log(f"[check] tessdata/:     {checks['tessdata_dir']}  -> {tessdata_dir}")
+    _log(f"[check]   osd.traineddata: {checks['osd_trained']}")
+    _log(f"[check]   eng.traineddata: {checks['eng_trained']}")
+    _log(f"[check]   ron.traineddata: {checks['ron_trained']}")
+    _log(f"[check] pdftoppm.exe:  {checks['pdftoppm']}  -> {pdftoppm_exe}")
+    _log(f"[check] pdftocairo.exe:{checks['pdftocairo']} -> {pdftocairo_exe}")
+
+    if checks["tesseract_exe"]:
+        pytesseract.pytesseract.tesseract_cmd = str(tesseract_exe)
+        _log(f"[set] pytesseract.tesseract_cmd = {tesseract_exe}")
+
+    if not checks["osd_trained"]:
+        _log("⚠️ Lipsă osd.traineddata → OSD (rotire grosieră) poate eșua.")
+    if not checks["pdftoppm"]:
+        _log("⚠️ Lipsă pdftoppm.exe → conversia PDF→imagine (pdf2image) va eșua pe Windows.")
+
+    return checks
+
 # ===================== OCR core =====================
 
 # --- Robust deskew (OSD + Hough + clamp) ---
@@ -207,13 +277,21 @@ def pil_to_bgr(im: Image.Image) -> np.ndarray:
 
 def process_pdf(pdf_path: Path, outdir: Path, dpi=300, lang="ron+eng", psm=4,
                 save_debug=False, start=None, end=None, log=lambda *_: None,
-                use_paragraph_filter=True, min_words_per_par=8, min_par_mean_conf=65, wrap_width=100):
+                use_paragraph_filter=True, min_words_per_par=8, min_par_mean_conf=65, wrap_width=100,
+                poppler_path: str | None = None):
     outdir.mkdir(parents=True, exist_ok=True)
     dbgdir = outdir / "debug"
     if save_debug:
         dbgdir.mkdir(exist_ok=True)
 
-    pages = convert_from_path(str(pdf_path), dpi=dpi, first_page=start, last_page=end)
+    # Convertim paginile PDF la imagini; pe Windows e necesar poppler_path
+    pages = convert_from_path(
+        str(pdf_path),
+        dpi=dpi,
+        first_page=start,
+        last_page=end,
+        poppler_path=poppler_path
+    )
 
     combined_text_raw = []
     combined_text_clean = []
@@ -249,7 +327,6 @@ def process_pdf(pdf_path: Path, outdir: Path, dpi=300, lang="ron+eng", psm=4,
             page_txt_clean = outdir / "pages_clean" / f"page_{idx:03d}_clean.txt"
             page_txt_clean.write_text(clean_text, encoding="utf-8")
             combined_text_clean.append(clean_text)
-            # folosim pentru log mean_conf_global (informativ)
             page_stats.append((idx, mean_conf_global))
             log(f"[pagina {idx}] conf_global={mean_conf_global:.2f} (raw_mean={raw_mean_conf:.2f})")
         else:
@@ -287,14 +364,14 @@ class OCRGui(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("PDF Scan OCR (Tesseract)")
-        self.geometry("880x640")
+        self.geometry("900x680")
         self.resizable(True, True)
 
         # Vars
         self.pdf_path   = tk.StringVar()
         self.out_dir    = tk.StringVar(value=str(Path("pdf_ocr_output").absolute()))
         self.dpi        = tk.IntVar(value=300)
-        self.lang       = tk.StringVar(value="ron+eng")
+        self.lang       = tk.StringVar(value="ron")
         self.psm        = tk.StringVar(value="4")
         self.debug      = tk.BooleanVar(value=False)
         self.start_page = tk.StringVar()
@@ -311,6 +388,10 @@ class OCRGui(tk.Tk):
         self.log_q = queue.Queue()
         self.after(100, self._poll_log)
         self.worker = None
+
+        # Startup info
+        _ = _frozen_base_dir(self._log)
+        _ = _bin_dir(self._log)
 
     def _build_ui(self):
         pad = {'padx': 8, 'pady': 6}
@@ -349,7 +430,7 @@ class OCRGui(tk.Tk):
         ttk.Entry(frm4, textvariable=self.end_page, width=8).pack(side='left', padx=6)
 
         # Row 5: Paragraph filtering (debug)
-        frm5 = ttk.Labelframe(self, text="Paragraph filtering (debug)")
+        frm5 = ttk.Labelframe(self, text="Paragraph filtering")
         frm5.pack(fill='x', **pad)
         ttk.Checkbutton(frm5, text="Use paragraph filtering", variable=self.use_par_filter).grid(row=0, column=0, sticky='w', padx=6, pady=4, columnspan=2)
 
@@ -377,7 +458,7 @@ class OCRGui(tk.Tk):
         # Row 7: Log
         frm7 = ttk.Frame(self); frm7.pack(fill='both', expand=True, **pad)
         ttk.Label(frm7, text="Log:").pack(anchor='w')
-        self.log_txt = tk.Text(frm7, height=12, wrap='word')
+        self.log_txt = tk.Text(frm7, height=14, wrap='word')
         self.log_txt.pack(fill='both', expand=True)
         self.log_txt.configure(state='disabled')
 
@@ -445,6 +526,11 @@ class OCRGui(tk.Tk):
         min_conf  = int(self.min_par_mean_conf.get())
         wrap_w    = int(self.wrap_width.get())
 
+        # determină BIN PATH + health check
+        bin_path = _bin_dir(self._log)
+        self._log(f"[info] BIN PATH → {bin_path}")
+        _ = _health_check(bin_path, self._log)
+
         # pornește thread-ul de lucru
         self.run_btn.configure(state='disabled')
         self.pb.start(10)
@@ -469,7 +555,8 @@ class OCRGui(tk.Tk):
                     use_paragraph_filter=use_par_filter,
                     min_words_per_par=min_words,
                     min_par_mean_conf=min_conf,
-                    wrap_width=wrap_w
+                    wrap_width=wrap_w,
+                    poppler_path=str(bin_path)  # important pe Windows
                 )
             except Exception as e:
                 self._log(f"❌ Eroare: {e}")
@@ -510,6 +597,8 @@ def main_cli():
     args = ap.parse_args()
 
     if args.cli:
+        bin_path = _bin_dir(print)
+        _ = _health_check(bin_path, print)
         process_pdf(
             pdf_path=Path(args.pdf),
             outdir=Path(args.outdir),
@@ -523,7 +612,8 @@ def main_cli():
             use_paragraph_filter=args.use_par_filter,
             min_words_per_par=args.min_words_per_par,
             min_par_mean_conf=args.min_par_mean_conf,
-            wrap_width=args.wrap_width
+            wrap_width=args.wrap_width,
+            poppler_path=str(bin_path)
         )
     else:
         app = OCRGui()
