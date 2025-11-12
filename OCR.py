@@ -144,7 +144,7 @@ def preprocess_for_ocr(
     adaptive_block: int = 31,
     adaptive_C: int = 10,
     use_osd: bool = True,
-    max_abs_angle: float = 15.0
+    max_abs_angle: float =1.0
 ) -> np.ndarray:
     """Pipeline pentru documente scanate: robust deskew + normalizare + binarizare."""
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -309,12 +309,13 @@ def process_pdf(pdf_path: Path, outdir: Path, dpi=300, lang="ron+eng", psm=4,
 
         # RAW (brut)
         raw_text, raw_mean_conf = ocr_image(prep, lang=lang, psm=psm)
-        (outdir / "pages").mkdir(exist_ok=True)
-        (outdir / "pages_clean").mkdir(exist_ok=True)
-
-        page_txt_raw = outdir / "pages" / f"page_{idx:03d}.txt"
-        page_txt_raw.write_text(raw_text, encoding="utf-8")
-        combined_text_raw.append(raw_text)
+        if save_debug:
+            (outdir / "pagini_debug").mkdir(exist_ok=True)
+        (outdir / "pagini_individuale").mkdir(exist_ok=True)
+        if save_debug:
+            page_txt_raw = outdir / "pagini_debug" / f"{pdf_path.name}_pagina_{idx:03d}_debug.txt"
+            page_txt_raw.write_text(raw_text, encoding="utf-8")
+            combined_text_raw.append(raw_text)
 
         # CLEAN (paragrafe filtrate + formatate)
         if use_paragraph_filter:
@@ -324,7 +325,7 @@ def process_pdf(pdf_path: Path, outdir: Path, dpi=300, lang="ron+eng", psm=4,
                 min_par_mean_conf=min_par_mean_conf,
                 wrap_width=wrap_width
             )
-            page_txt_clean = outdir / "pages_clean" / f"page_{idx:03d}_clean.txt"
+            page_txt_clean = outdir / "pagini_individuale" / f"{pdf_path.name}_page_{idx:03d}.txt"
             page_txt_clean.write_text(clean_text, encoding="utf-8")
             combined_text_clean.append(clean_text)
             page_stats.append((idx, mean_conf_global))
@@ -336,22 +337,24 @@ def process_pdf(pdf_path: Path, outdir: Path, dpi=300, lang="ron+eng", psm=4,
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # Scriem combinatul brut
-    combined_path_raw = outdir / f"pdf_ocr_{ts}.txt"
-    combined_path_raw.write_text("\n\n".join(combined_text_raw), encoding="utf-8")
-    log(f"📝 Text combinat (raw):   {combined_path_raw}")
+    if save_debug:
+        combined_path_raw = outdir / f"{pdf_path.name}_{ts}_debug.txt"
+        combined_path_raw.write_text("\n\n".join(combined_text_raw), encoding="utf-8")
+        log(f"📝 Text combinat (raw):   {combined_path_raw}")
 
     # Scriem combinatul curat (dacă s-a folosit filtrarea)
     if use_paragraph_filter:
-        combined_path_clean = outdir / f"pdf_ocr_clean_{ts}.txt"
+        combined_path_clean = outdir / f"{pdf_path.name}_{ts}.txt"
         combined_path_clean.write_text("\n\n".join(combined_text_clean), encoding="utf-8")
         log(f"🧹 Text combinat (clean): {combined_path_clean}")
 
     # Statistici (pe pagina, din global/ raw)
-    stats_path = outdir / f"stats_{ts}.txt"
-    with open(stats_path, "w", encoding="utf-8") as f:
-        for i, c in page_stats:
-            f.write(f"page {i:03d}: mean_conf={c:.2f}\n")
-    log(f"📈 Statistici: {stats_path}")
+    if save_debug:
+        stats_path = outdir / f"stats_{ts}.txt"
+        with open(stats_path, "w", encoding="utf-8") as f:
+            for i, c in page_stats:
+                f.write(f"page {i:03d}: mean_conf={c:.2f}\n")
+        log(f"📈 Statistici: {stats_path}")
 
     if save_debug:
         log(f"🔍 Debug images: {dbgdir}")
@@ -420,13 +423,13 @@ class OCRGui(tk.Tk):
         psm_box = ttk.Combobox(frm3, textvariable=self.psm, values=["1","3","4","6","11","12"], width=6, state="readonly")
         psm_box.pack(side='left', padx=6)
 
-        ttk.Checkbutton(frm3, text="Debug images", variable=self.debug).pack(side='left', padx=12)
+        ttk.Checkbutton(frm3, text="Debug", variable=self.debug).pack(side='left', padx=12)
 
         # Row 4: Start/End pages
         frm4 = ttk.Frame(self); frm4.pack(fill='x', **pad)
-        ttk.Label(frm4, text="Start page:").pack(side='left')
+        ttk.Label(frm4, text="Pagina start:").pack(side='left')
         ttk.Entry(frm4, textvariable=self.start_page, width=8).pack(side='left', padx=6)
-        ttk.Label(frm4, text="End page:").pack(side='left')
+        ttk.Label(frm4, text="Pagina sfarsit:").pack(side='left')
         ttk.Entry(frm4, textvariable=self.end_page, width=8).pack(side='left', padx=6)
 
         # Row 5: Paragraph filtering (debug)
@@ -434,7 +437,7 @@ class OCRGui(tk.Tk):
         frm5.pack(fill='x', **pad)
         ttk.Checkbutton(frm5, text="Use paragraph filtering", variable=self.use_par_filter).grid(row=0, column=0, sticky='w', padx=6, pady=4, columnspan=2)
 
-        ttk.Label(frm5, text="Min words / paragraph:").grid(row=1, column=0, sticky='w', padx=6, pady=4)
+        ttk.Label(frm5, text="Cuvinte min. per paragraf:").grid(row=1, column=0, sticky='w', padx=6, pady=4)
         ttk.Spinbox(frm5, from_=1, to=50, textvariable=self.min_words_per_par, width=6).grid(row=1, column=1, sticky='w', padx=6, pady=4)
 
         ttk.Label(frm5, text="Min mean conf (paragraph):").grid(row=1, column=2, sticky='w', padx=6, pady=4)
