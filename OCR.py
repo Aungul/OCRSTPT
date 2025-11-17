@@ -379,6 +379,7 @@ class OCRGui(tk.Tk):
         self.debug      = tk.BooleanVar(value=False)
         self.start_page = tk.StringVar()
         self.end_page   = tk.StringVar()
+        self.doc_path   = tk.StringVar(value="Documentatie.pdf")
 
         # Paragraph filtering (debuggable)
         self.use_par_filter     = tk.BooleanVar(value=True)
@@ -454,6 +455,7 @@ class OCRGui(tk.Tk):
         self.run_btn = ttk.Button(frm6, text="Rulează OCR", command=self._run_clicked)
         self.run_btn.pack(side='left')
         ttk.Button(frm6, text="Deschide output", command=self._open_outdir).pack(side='left', padx=8)
+        ttk.Button(frm6, text="Deschide doc", command=self._open_doc).pack(side="left", padx=8)
 
         self.pb = ttk.Progressbar(frm6, mode='indeterminate', length=220)
         self.pb.pack(side='right')
@@ -490,6 +492,25 @@ class OCRGui(tk.Tk):
                 os.system(f"open '{path}'")
             else:
                 os.system(f"xdg-open '{path}'")
+
+    def _open_doc(self):
+    # baza e folderul binarului
+        base = _bin_dir(self._log)
+        if not base:
+            return
+        
+        doc_file = self.doc_path.get().strip()
+
+        doc_path = base / doc_file  # construim calea completă
+        if doc_path.exists():
+            if sys.platform.startswith("win"):
+                os.startfile(str(doc_path))
+            elif sys.platform == "darwin":
+                os.system(f"open '{doc_path}'")
+            else:
+                os.system(f"xdg-open '{doc_path}'")
+        else:
+            self._log(f"⚠️ Documentația nu a fost găsită: {doc_path}")
 
     def _log(self, msg):
         self.log_q.put(str(msg))
