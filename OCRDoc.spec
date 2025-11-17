@@ -13,6 +13,7 @@ a = Analysis(
     datas=[
         ('thirdparty/tesseract/tessdata', 'bin/tessdata'),
         ('licenses', 'licenses'),
+        ('Documentatie.pdf', 'bin'),
     ],
     hiddenimports=collect_submodules('PIL'),
 )
